@@ -1,0 +1,1148 @@
+--// Script Reconstructor Module
+--// Analyzes decompiled client scripts and generates approximate server-side counterparts
+
+local ScriptReconstructor = {}
+
+-- Configuration
+ScriptReconstructor.OutputFolder = "ReconstructedScripts"
+ScriptReconstructor.Debug = true
+
+--------------------------------------------------------------------------------
+-- UTILITY HELPERS
+--------------------------------------------------------------------------------
+
+local function log(...)
+	if ScriptReconstructor.Debug then
+		print("[Reconstructor]", ...)
+	end
+end
+
+local function splitLines(str)
+	local lines = {}
+	for line in str:gmatch("([^\n]*)\n?") do
+		table.insert(lines, line)
+	end
+	return lines
+end
+
+local function trim(s)
+	return s:match("^%s*(.-)%s*$")
+end
+
+local function getIndent(depth)
+	return string.rep("\t", depth)
+end
+
+--------------------------------------------------------------------------------
+-- PATTERN DATABASE
+-- Each pattern has:
+--   match: function(source) -> table of extracted info or nil
+--   reconstruct: function(info) -> { name, source, serviceParent }
+--------------------------------------------------------------------------------
+
+local PatternDatabase = {}
+
+--[[
+    PATTERN 1: OnClientEvent with contextual clues
+    Detects: RemoteEvent:OnClientEvent connections
+    Analyzes the callback body for clues about WHY the remote fires
+]]
+table.insert(PatternDatabase, {
+	name = "OnClientEvent_Handler",
+	priority = 10,
+
+	match = function(source)
+		local results = {}
+
+		-- Match patterns like:
+		-- game.ReplicatedStorage.RemoteName.OnClientEvent:Connect(function(...)
+		-- game:GetService("ReplicatedStorage").RemoteName.OnClientEvent:Connect(function(...)
+		-- remotevariable.OnClientEvent:Connect(function(...)
+
+		-- First, find all remote variable assignments
+		local remoteVars = {}
+		for varName, path in source:gmatch("local%s+(%w+)%s*=%s*(.-)\n") do
+			local remoteName = path:match("%.(%w+)%s*$")
+			local service = path:match('GetService%("(%w+)"%)') or path:match("game%.(%w+)")
+			if remoteName then
+				remoteVars[varName] = {
+					name = remoteName,
+					service = service or "ReplicatedStorage",
+					fullPath = trim(path)
+				}
+			end
+		end
+
+		-- Pattern A: Direct path OnClientEvent
+		for fullPath, remoteName, params, body in source:gmatch(
+			"(game[%.%:][%w%:%(%)\"%._]+%.(%w+))%.OnClientEvent%:Connect%(function%((.-)%)(.-)end%)"
+		) do
+			local info = {
+				remoteName = remoteName,
+				remotePath = fullPath,
+				parameters = {},
+				body = body,
+				bodyRaw = trim(body),
+				contextClues = {},
+				remoteType = "RemoteEvent"
+			}
+
+			-- Parse parameters
+			for param in params:gmatch("([%w_]+)") do
+				table.insert(info.parameters, param)
+			end
+
+			-- Analyze body for context clues
+			analyzeBody(info, body)
+
+			table.insert(results, info)
+		end
+
+		-- Pattern B: Variable-based OnClientEvent
+		for varName, params, body in source:gmatch(
+			"(%w+)%.OnClientEvent%:Connect%(function%((.-)%)(.-)end%)"
+		) do
+			if remoteVars[varName] then
+				local info = {
+					remoteName = remoteVars[varName].name,
+					remotePath = remoteVars[varName].fullPath,
+					parameters = {},
+					body = body,
+					bodyRaw = trim(body),
+					contextClues = {},
+					remoteType = "RemoteEvent"
+				}
+
+				for param in params:gmatch("([%w_]+)") do
+					table.insert(info.parameters, param)
+				end
+
+				analyzeBody(info, body)
+				table.insert(results, info)
+			end
+		end
+
+		if #results > 0 then
+			return results
+		end
+		return nil
+	end,
+
+	reconstruct = function(infoList)
+		local scripts = {}
+
+		for _, info in ipairs(infoList) do
+			local source = generateServerScript(info)
+			table.insert(scripts, {
+				name = info.remoteName,
+				source = source,
+				parent = "ServerScriptService"
+			})
+		end
+
+		return scripts
+	end
+})
+
+--[[
+    PATTERN 2: InvokeServer calls
+    Detects: RemoteFunction:InvokeServer(...)
+    Reconstructs the server-side OnServerInvoke handler
+]]
+table.insert(PatternDatabase, {
+	name = "InvokeServer_Call",
+	priority = 9,
+
+	match = function(source)
+		local results = {}
+
+		-- Match: remote:InvokeServer(args)
+		-- And capture what's done with the return value
+		for context, fullPath, remoteName, args in source:gmatch(
+			"(local%s+%w+%s*=%s*)(game[%.%:][%w%:%(%)\"%._]+%.(%w+))%:InvokeServer%((.-)%)"
+		) do
+			local returnVar = context:match("local%s+(%w+)")
+
+			local info = {
+				remoteName = remoteName,
+				remotePath = fullPath,
+				arguments = {},
+				returnVar = returnVar,
+				remoteType = "RemoteFunction",
+				contextClues = {},
+				usageAfterInvoke = {}
+			}
+
+			-- Parse arguments
+			for arg in args:gmatch("([^,]+)") do
+				table.insert(info.arguments, trim(arg))
+			end
+
+			-- Look for how return value is used
+			if returnVar then
+				for usage in source:gmatch(returnVar .. "([^\n]+)") do
+					table.insert(info.usageAfterInvoke, trim(usage))
+				end
+				analyzeReturnUsage(info)
+			end
+
+			table.insert(results, info)
+		end
+
+		-- Also match without return value capture
+		for fullPath, remoteName, args in source:gmatch(
+			"(game[%.%:][%w%:%(%)\"%._]+%.(%w+))%:InvokeServer%((.-)%)"
+		) do
+			-- Skip if already captured above
+			local alreadyCaptured = false
+			for _, r in ipairs(results) do
+				if r.remoteName == remoteName then
+					alreadyCaptured = true
+					break
+				end
+			end
+
+			if not alreadyCaptured then
+				local info = {
+					remoteName = remoteName,
+					remotePath = fullPath,
+					arguments = {},
+					returnVar = nil,
+					remoteType = "RemoteFunction",
+					contextClues = {},
+					usageAfterInvoke = {}
+				}
+
+				for arg in args:gmatch("([^,]+)") do
+					table.insert(info.arguments, trim(arg))
+				end
+
+				table.insert(results, info)
+			end
+		end
+
+		if #results > 0 then
+			return results
+		end
+		return nil
+	end,
+
+	reconstruct = function(infoList)
+		local scripts = {}
+
+		for _, info in ipairs(infoList) do
+			local source = generateServerInvokeHandler(info)
+			table.insert(scripts, {
+				name = info.remoteName .. "_Handler",
+				source = source,
+				parent = "ServerScriptService"
+			})
+		end
+
+		return scripts
+	end
+})
+
+--[[
+    PATTERN 3: FireServer calls
+    Detects: RemoteEvent:FireServer(...)
+    Reconstructs the server-side OnServerEvent handler
+]]
+table.insert(PatternDatabase, {
+	name = "FireServer_Call",
+	priority = 8,
+
+	match = function(source)
+		local results = {}
+
+		-- Match patterns like remote:FireServer(arg1, arg2)
+		for fullPath, remoteName, args in source:gmatch(
+			"(game[%.%:][%w%:%(%)\"%._]+%.(%w+))%:FireServer%((.-)%)"
+		) do
+			local info = {
+				remoteName = remoteName,
+				remotePath = fullPath,
+				arguments = {},
+				remoteType = "RemoteEvent",
+				direction = "ClientToServer",
+				contextClues = {},
+				surroundingCode = {}
+			}
+
+			for arg in args:gmatch("([^,]+)") do
+				table.insert(info.arguments, trim(arg))
+			end
+
+			-- Capture surrounding context (5 lines before and after)
+			local lines = splitLines(source)
+			for i, line in ipairs(lines) do
+				if line:find(remoteName .. "%:FireServer") then
+					for j = math.max(1, i - 5), math.min(#lines, i + 5) do
+						table.insert(info.surroundingCode, lines[j])
+					end
+					break
+				end
+			end
+
+			analyzeFireServerContext(info)
+			table.insert(results, info)
+		end
+
+		-- Variable-based FireServer
+		local remoteVars = {}
+		for varName, path in source:gmatch("local%s+(%w+)%s*=%s*(.-)\n") do
+			local remoteName = path:match("%.(%w+)%s*$")
+			if remoteName then
+				remoteVars[varName] = { name = remoteName, fullPath = trim(path) }
+			end
+		end
+
+		for varName, args in source:gmatch("(%w+)%:FireServer%((.-)%)") do
+			if remoteVars[varName] then
+				local alreadyCaptured = false
+				for _, r in ipairs(results) do
+					if r.remoteName == remoteVars[varName].name then
+						alreadyCaptured = true
+						break
+					end
+				end
+
+				if not alreadyCaptured then
+					local info = {
+						remoteName = remoteVars[varName].name,
+						remotePath = remoteVars[varName].fullPath,
+						arguments = {},
+						remoteType = "RemoteEvent",
+						direction = "ClientToServer",
+						contextClues = {}
+					}
+
+					for arg in args:gmatch("([^,]+)") do
+						table.insert(info.arguments, trim(arg))
+					end
+
+					analyzeFireServerContext(info)
+					table.insert(results, info)
+				end
+			end
+		end
+
+		if #results > 0 then
+			return results
+		end
+		return nil
+	end,
+
+	reconstruct = function(infoList)
+		local scripts = {}
+
+		for _, info in ipairs(infoList) do
+			local source = generateOnServerEventHandler(info)
+			table.insert(scripts, {
+				name = info.remoteName .. "_Server",
+				source = source,
+				parent = "ServerScriptService"
+			})
+		end
+
+		return scripts
+	end
+})
+
+--[[
+    PATTERN 4: Attribute/Value listeners that suggest server replication
+    Detects: Instance:GetAttributeChangedSignal / .Changed events
+]]
+table.insert(PatternDatabase, {
+	name = "AttributeValue_Listener",
+	priority = 5,
+
+	match = function(source)
+		local results = {}
+
+		-- GetAttributeChangedSignal
+		for obj, attr, body in source:gmatch(
+			"(%w+)%:GetAttributeChangedSignal%(\"(%w+)\"%):Connect%(function%(%)(.-)end%)"
+		) do
+			table.insert(results, {
+				type = "attribute",
+				objectVar = obj,
+				attributeName = attr,
+				body = body,
+				contextClues = {}
+			})
+		end
+
+		-- .Changed on ValueBase objects
+		for obj, body in source:gmatch(
+			"(%w+)%.Changed%:Connect%(function%((.-)%)(.-)end%)"
+		) do
+			table.insert(results, {
+				type = "valueChanged",
+				objectVar = obj,
+				body = body,
+				contextClues = {}
+			})
+		end
+
+		if #results > 0 then
+			return results
+		end
+		return nil
+	end,
+
+	reconstruct = function(infoList)
+		local scripts = {}
+
+		for _, info in ipairs(infoList) do
+			if info.type == "attribute" then
+				local src = string.format(
+					[[-- Server script that sets attribute "%s"
+-- This attribute is listened to on the client
+
+game.Players.PlayerAdded:Connect(function(player)
+	-- TODO: Determine the object this attribute belongs to
+	-- Setting attribute "%s" based on game logic
+	-- object:SetAttribute("%s", value)
+end)
+]],
+					info.attributeName, info.attributeName, info.attributeName
+				)
+				table.insert(scripts, {
+					name = info.attributeName .. "_AttributeSetter",
+					source = src,
+					parent = "ServerScriptService"
+				})
+			end
+		end
+
+		return scripts
+	end
+})
+
+--------------------------------------------------------------------------------
+-- BODY / CONTEXT ANALYSIS ENGINE
+--------------------------------------------------------------------------------
+
+function analyzeBody(info, body)
+	if not body then return end
+
+	local clues = info.contextClues
+
+	-- Check for developer/admin related keywords
+	local devKeywords = { "dev", "admin", "creator", "owner", "moderator", "mod", "staff" }
+	for _, keyword in ipairs(devKeywords) do
+		if body:lower():find(keyword) then
+			table.insert(clues, { type = "role_check", role = keyword })
+		end
+	end
+
+	-- Check for GUI manipulation (suggests UI update remote)
+	if body:find("Visible%s*=") or body:find("%.Text%s*=") or body:find("%.Image%s*=") then
+		table.insert(clues, { type = "gui_update" })
+	end
+
+	-- Check for leaderstat / stat references
+	if body:find("leaderstats") or body:find("%.Value") then
+		table.insert(clues, { type = "stat_update" })
+	end
+
+	-- Check for sound playing
+	if body:find(":Play%(%)") or body:find("Sound") then
+		table.insert(clues, { type = "sound_play" })
+	end
+
+	-- Check for particle/effect spawning
+	if body:find("Emit") or body:find("Particle") or body:find("Effect") then
+		table.insert(clues, { type = "vfx" })
+	end
+
+	-- Check for teleportation
+	if body:find("CFrame") or body:find("Position") or body:find("Teleport") then
+		table.insert(clues, { type = "teleport" })
+	end
+
+	-- Check for tool/item granting
+	if body:find("Backpack") or body:find("Tool") or body:find("Clone") then
+		table.insert(clues, { type = "item_grant" })
+	end
+
+	-- Check for notification/message patterns
+	if body:find("print") or body:find("warn") or body:find("Notification") or body:find("Message") then
+		table.insert(clues, { type = "notification" })
+	end
+
+	-- Check for data store patterns
+	if body:find("DataStore") or body:find("Save") or body:find("Load") then
+		table.insert(clues, { type = "data_persistence" })
+	end
+
+	-- Check for gamepass/product checks
+	if body:find("GamePass") or body:find("MarketplaceService") or body:find("gamepass") then
+		table.insert(clues, { type = "monetization" })
+	end
+
+	-- Check for team/group checks
+	if body:find("Team") or body:find("GetRankInGroup") or body:find("IsInGroup") then
+		table.insert(clues, { type = "group_check" })
+	end
+
+	-- Analyze parameters for clue about what data is sent
+	for _, param in ipairs(info.parameters or {}) do
+		local paramLower = param:lower()
+		if paramLower:find("data") then
+			table.insert(clues, { type = "data_param", param = param })
+		elseif paramLower:find("player") or paramLower:find("plr") then
+			table.insert(clues, { type = "player_param", param = param })
+		elseif paramLower:find("item") or paramLower:find("tool") then
+			table.insert(clues, { type = "item_param", param = param })
+		elseif paramLower:find("pos") or paramLower:find("cf") or paramLower:find("vector") then
+			table.insert(clues, { type = "spatial_param", param = param })
+		elseif paramLower:find("amount") or paramLower:find("count") or paramLower:find("num") then
+			table.insert(clues, { type = "numeric_param", param = param })
+		elseif paramLower:find("msg") or paramLower:find("message") or paramLower:find("text") then
+			table.insert(clues, { type = "message_param", param = param })
+		end
+	end
+
+	-- Look for specific string literals that give clues
+	for str in body:gmatch('"([^"]+)"') do
+		table.insert(clues, { type = "string_literal", value = str })
+	end
+	for str in body:gmatch("'([^']+)'") do
+		table.insert(clues, { type = "string_literal", value = str })
+	end
+end
+
+function analyzeReturnUsage(info)
+	local clues = info.contextClues
+
+	for _, usage in ipairs(info.usageAfterInvoke) do
+		if usage:find("%.Value") or usage:find("leaderstats") then
+			table.insert(clues, { type = "returns_stat_data" })
+		end
+		if usage:find("table") or usage:find("%[") then
+			table.insert(clues, { type = "returns_table" })
+		end
+		if usage:find("if%s+") or usage:find("then") then
+			table.insert(clues, { type = "returns_boolean_check" })
+		end
+	end
+end
+
+function analyzeFireServerContext(info)
+	local clues = info.contextClues
+
+	-- Analyze arguments being sent
+	for _, arg in ipairs(info.arguments or {}) do
+		local argLower = arg:lower()
+		if argLower:find("mouse") or argLower:find("hit") then
+			table.insert(clues, { type = "mouse_target", arg = arg })
+		elseif argLower:find("humanoidrootpart") or argLower:find("cframe") then
+			table.insert(clues, { type = "position_data", arg = arg })
+		elseif argLower:find("tool") or argLower:find("item") then
+			table.insert(clues, { type = "item_reference", arg = arg })
+		elseif argLower:find("action") or argLower:find("type") then
+			table.insert(clues, { type = "action_type", arg = arg })
+		end
+	end
+
+	-- Analyze surrounding code context
+	for _, line in ipairs(info.surroundingCode or {}) do
+		if line:find("UserInputService") or line:find("InputBegan") then
+			table.insert(clues, { type = "input_triggered" })
+		end
+		if line:find("Touched") then
+			table.insert(clues, { type = "touch_triggered" })
+		end
+		if line:find("TextButton") or line:find("MouseButton1Click") or line:find("Activated") then
+			table.insert(clues, { type = "gui_button_triggered" })
+		end
+		if line:find("ProximityPrompt") then
+			table.insert(clues, { type = "proximity_triggered" })
+		end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- SERVER SCRIPT GENERATORS
+--------------------------------------------------------------------------------
+
+function generateServerScript(info)
+	local lines = {}
+	local indent = 0
+
+	local function addLine(text)
+		table.insert(lines, getIndent(indent) .. text)
+	end
+
+	local function addBlank()
+		table.insert(lines, "")
+	end
+
+	-- Header comment
+	addLine("-- Auto-reconstructed server script for RemoteEvent: " .. info.remoteName)
+	addLine("-- Based on analysis of client-side OnClientEvent handler")
+	addLine("-- Clues found: " .. #info.contextClues)
+	addBlank()
+
+	-- Determine the firing strategy based on context clues
+	local hasRoleCheck = false
+	local roleType = nil
+	local hasGuiUpdate = false
+	local hasStatUpdate = false
+	local hasItemGrant = false
+	local hasMonetization = false
+	local hasGroupCheck = false
+	local hasNotification = false
+	local dataParams = {}
+
+	for _, clue in ipairs(info.contextClues) do
+		if clue.type == "role_check" then
+			hasRoleCheck = true
+			roleType = clue.role
+		elseif clue.type == "gui_update" then
+			hasGuiUpdate = true
+		elseif clue.type == "stat_update" then
+			hasStatUpdate = true
+		elseif clue.type == "item_grant" then
+			hasItemGrant = true
+		elseif clue.type == "monetization" then
+			hasMonetization = true
+		elseif clue.type == "group_check" then
+			hasGroupCheck = true
+		elseif clue.type == "notification" then
+			hasNotification = true
+		elseif clue.type == "data_param" or clue.type == "numeric_param"
+			or clue.type == "message_param" or clue.type == "item_param" then
+			table.insert(dataParams, clue)
+		end
+	end
+
+	-- Services
+	local servicesNeeded = { "Players" }
+	if hasMonetization then
+		table.insert(servicesNeeded, "MarketplaceService")
+	end
+	if hasGroupCheck then
+		-- GroupService is rarely used directly, usually player:IsInGroup
+	end
+
+	for _, svc in ipairs(servicesNeeded) do
+		addLine(string.format('local %s = game:GetService("%s")', svc, svc))
+	end
+	addBlank()
+
+	-- Remote reference
+	addLine(string.format("local %s = %s", info.remoteName, info.remotePath))
+	addBlank()
+
+	-- Build the server logic
+	if hasRoleCheck then
+		-- Role/permission based firing
+		addLine("-- Detected: This remote fires to specific users based on role/permissions")
+		addBlank()
+
+		if roleType == "dev" or roleType == "creator" or roleType == "owner" then
+			addLine("Players.PlayerAdded:Connect(function(player)")
+			indent = indent + 1
+			addLine("if player.UserId == game.CreatorId then")
+			indent = indent + 1
+			if #info.parameters > 0 then
+				local paramComment = "-- Parameters sent to client: " .. table.concat(info.parameters, ", ")
+				addLine(paramComment)
+				addLine(string.format("%s:FireClient(player)", info.remoteName))
+			else
+				addLine(string.format("%s:FireClient(player)", info.remoteName))
+			end
+			indent = indent - 1
+			addLine("end")
+			indent = indent - 1
+			addLine("end)")
+
+		elseif roleType == "admin" or roleType == "moderator" or roleType == "mod" or roleType == "staff" then
+			addLine("local AUTHORIZED_USER_IDS = {")
+			indent = indent + 1
+			addLine("-- Add authorized user IDs here")
+			addLine("-- 123456789,")
+			indent = indent - 1
+			addLine("}")
+			addBlank()
+			addLine("local function isAuthorized(player)")
+			indent = indent + 1
+			addLine("for _, id in ipairs(AUTHORIZED_USER_IDS) do")
+			indent = indent + 1
+			addLine("if player.UserId == id then")
+			indent = indent + 1
+			addLine("return true")
+			indent = indent - 1
+			addLine("end")
+			indent = indent - 1
+			addLine("end")
+			addLine("return player.UserId == game.CreatorId")
+			indent = indent - 1
+			addLine("end")
+			addBlank()
+			addLine("Players.PlayerAdded:Connect(function(player)")
+			indent = indent + 1
+			addLine("if isAuthorized(player) then")
+			indent = indent + 1
+			addLine(string.format("%s:FireClient(player)", info.remoteName))
+			indent = indent - 1
+			addLine("end")
+			indent = indent - 1
+			addLine("end)")
+		end
+
+	elseif hasGroupCheck then
+		addLine("-- Detected: This remote involves group rank/membership checks")
+		addBlank()
+		addLine("local GROUP_ID = 0 -- TODO: Set your group ID")
+		addLine("local MIN_RANK = 0 -- TODO: Set minimum rank")
+		addBlank()
+		addLine("Players.PlayerAdded:Connect(function(player)")
+		indent = indent + 1
+		addLine("if player:GetRankInGroup(GROUP_ID) >= MIN_RANK then")
+		indent = indent + 1
+		addLine(string.format("%s:FireClient(player)", info.remoteName))
+		indent = indent - 1
+		addLine("end")
+		indent = indent - 1
+		addLine("end)")
+
+	elseif hasMonetization then
+		addLine("-- Detected: This remote involves gamepass/product ownership")
+		addBlank()
+		addLine("local GAMEPASS_ID = 0 -- TODO: Set your gamepass ID")
+		addBlank()
+		addLine("Players.PlayerAdded:Connect(function(player)")
+		indent = indent + 1
+		addLine("local success, hasPass = pcall(function()")
+		indent = indent + 1
+		addLine("return MarketplaceService:UserOwnsGamePassAsync(player.UserId, GAMEPASS_ID)")
+		indent = indent - 1
+		addLine("end)")
+		addBlank()
+		addLine("if success and hasPass then")
+		indent = indent + 1
+		addLine(string.format("%s:FireClient(player)", info.remoteName))
+		indent = indent - 1
+		addLine("end")
+		indent = indent - 1
+		addLine("end)")
+
+	elseif hasStatUpdate then
+		addLine("-- Detected: This remote sends stat/leaderstat updates to the client")
+		addBlank()
+		addLine("Players.PlayerAdded:Connect(function(player)")
+		indent = indent + 1
+		addLine('local leaderstats = Instance.new("Folder")')
+		addLine('leaderstats.Name = "leaderstats"')
+		addLine("leaderstats.Parent = player")
+		addBlank()
+		addLine("-- TODO: Create stat values and fire remote when they change")
+		if #info.parameters > 0 then
+			addLine(string.format("-- Client expects parameters: %s", table.concat(info.parameters, ", ")))
+		end
+		addLine(string.format("-- %s:FireClient(player, statData)", info.remoteName))
+		indent = indent - 1
+		addLine("end)")
+
+	elseif hasItemGrant then
+		addLine("-- Detected: This remote triggers item/tool granting on the client")
+		addBlank()
+		addLine("-- This likely fires when a player earns, buys, or picks up an item")
+		addLine("Players.PlayerAdded:Connect(function(player)")
+		indent = indent + 1
+		addLine("-- TODO: Determine when items should be granted")
+		if #info.parameters > 0 then
+			addLine(string.format("-- Client expects: %s", table.concat(info.parameters, ", ")))
+		end
+		addLine(string.format("-- %s:FireClient(player, itemData)", info.remoteName))
+		indent = indent - 1
+		addLine("end)")
+
+	elseif hasGuiUpdate and not hasRoleCheck then
+		addLine("-- Detected: This remote triggers GUI updates on the client")
+		addBlank()
+		addLine("-- The server fires this to update client UI elements")
+		addLine("-- Common triggers: game state changes, round updates, etc.")
+		addBlank()
+		addLine("local function notifyClient(player, ...)")
+		indent = indent + 1
+		addLine(string.format("%s:FireClient(player, ...)", info.remoteName))
+		indent = indent - 1
+		addLine("end")
+		addBlank()
+		addLine("local function notifyAllClients(...)")
+		indent = indent + 1
+		addLine(string.format("%s:FireAllClients(...)", info.remoteName))
+		indent = indent - 1
+		addLine("end")
+		addBlank()
+		addLine("-- TODO: Call notifyClient/notifyAllClients when game state changes")
+
+	elseif hasNotification and not hasRoleCheck then
+		addLine("-- Detected: This remote sends notifications/messages to clients")
+		addBlank()
+		addLine("local function sendNotification(player, message)")
+		indent = indent + 1
+		addLine(string.format('%s:FireClient(player, message)', info.remoteName))
+		indent = indent - 1
+		addLine("end")
+		addBlank()
+		addLine("local function broadcastNotification(message)")
+		indent = indent + 1
+		addLine(string.format('%s:FireAllClients(message)', info.remoteName))
+		indent = indent - 1
+		addLine("end")
+		addBlank()
+		addLine("-- TODO: Call these functions at appropriate times")
+
+	else
+		-- Generic / no strong clues
+		addLine("-- No strong contextual clues detected; generating generic handler")
+		addBlank()
+
+		if #info.parameters > 0 then
+			addLine(string.format("-- Client handler receives parameters: %s", table.concat(info.parameters, ", ")))
+			addBlank()
+		end
+
+		addLine("-- Option A: Fire to all clients (broadcast)")
+		addLine(string.format("-- %s:FireAllClients(...)", info.remoteName))
+		addBlank()
+		addLine("-- Option B: Fire to specific client")
+		addLine("Players.PlayerAdded:Connect(function(player)")
+		indent = indent + 1
+		addLine("-- TODO: Determine conditions for firing")
+		if #info.parameters > 0 then
+			local args = {}
+			for _, p in ipairs(info.parameters) do
+				table.insert(args, "nil --[[ " .. p .. " ]]")
+			end
+			addLine(string.format("%s:FireClient(player, %s)", info.remoteName, table.concat(args, ", ")))
+		else
+			addLine(string.format("%s:FireClient(player)", info.remoteName))
+		end
+		indent = indent - 1
+		addLine("end)")
+	end
+
+	-- Add string literal clues as comments
+	local stringLiterals = {}
+	for _, clue in ipairs(info.contextClues) do
+		if clue.type == "string_literal" then
+			table.insert(stringLiterals, clue.value)
+		end
+	end
+	if #stringLiterals > 0 then
+		addBlank()
+		addLine("-- String literals found in client handler (may provide context):")
+		for _, str in ipairs(stringLiterals) do
+			addLine('-- "' .. str .. '"')
+		end
+	end
+
+	return table.concat(lines, "\n")
+end
+
+function generateServerInvokeHandler(info)
+	local lines = {}
+	local indent = 0
+
+	local function addLine(text)
+		table.insert(lines, getIndent(indent) .. text)
+	end
+	local function addBlank()
+		table.insert(lines, "")
+	end
+
+	addLine("-- Auto-reconstructed server script for RemoteFunction: " .. info.remoteName)
+	addLine("-- Client calls :InvokeServer() and expects a return value")
+	addBlank()
+	addLine(string.format("local %s = %s", info.remoteName, info.remotePath))
+	addBlank()
+
+	-- Build parameter list for OnServerInvoke (player is always first)
+	local serverParams = { "player" }
+	for _, arg in ipairs(info.arguments) do
+		-- Try to generate meaningful param names from the client args
+		local paramName = arg:match("(%w+)$") or arg
+		paramName = paramName:gsub("[^%w_]", "_")
+		table.insert(serverParams, paramName)
+	end
+
+	addLine(string.format("%s.OnServerInvoke = function(%s)", info.remoteName, table.concat(serverParams, ", ")))
+	indent = indent + 1
+
+	-- Determine what to return based on clues
+	local returnsTable = false
+	local returnsBool = false
+
+	for _, clue in ipairs(info.contextClues) do
+		if clue.type == "returns_table" then
+			returnsTable = true
+		elseif clue.type == "returns_boolean_check" then
+			returnsBool = true
+		elseif clue.type == "returns_stat_data" then
+			returnsTable = true
+		end
+	end
+
+	if #info.arguments > 0 then
+		addLine("-- Client sends: " .. table.concat(info.arguments, ", "))
+	end
+	addBlank()
+
+	addLine("-- TODO: Implement server-side logic")
+	addLine("-- Validate the requesting player and parameters")
+	addBlank()
+
+	if returnsTable then
+		addLine("-- Client expects a table/data return value")
+		addLine("local result = {}")
+		addLine("-- TODO: Populate result")
+		addLine("return result")
+	elseif returnsBool then
+		addLine("-- Client checks the return value conditionally (likely boolean)")
+		addLine("-- TODO: Implement validation logic")
+		addLine("return false")
+	else
+		addLine("-- Return appropriate data to the client")
+		addLine("return nil")
+	end
+
+	indent = indent - 1
+	addLine("end")
+
+	return table.concat(lines, "\n")
+end
+
+function generateOnServerEventHandler(info)
+	local lines = {}
+	local indent = 0
+
+	local function addLine(text)
+		table.insert(lines, getIndent(indent) .. text)
+	end
+	local function addBlank()
+		table.insert(lines, "")
+	end
+
+	addLine("-- Auto-reconstructed server script for RemoteEvent: " .. info.remoteName)
+	addLine("-- Client fires :FireServer() to this remote")
+	addBlank()
+	addLine(string.format("local %s = %s", info.remoteName, info.remotePath))
+	addBlank()
+
+	-- Build parameter list
+	local serverParams = { "player" }
+	for _, arg in ipairs(info.arguments) do
+		local paramName = arg:match("(%w+)") or "arg"
+		paramName = paramName:gsub("[^%w_]", "_")
+		table.insert(serverParams, paramName)
+	end
+
+	addLine(string.format("%s.OnServerEvent:Connect(function(%s)", info.remoteName, table.concat(serverParams, ", ")))
+	indent = indent + 1
+
+	-- Analyze clues for security and purpose
+	local hasMouse = false
+	local hasPosition = false
+	local hasAction = false
+	local isInputTriggered = false
+	local isGuiTriggered = false
+	local isProximityTriggered = false
+
+	for _, clue in ipairs(info.contextClues) do
+		if clue.type == "mouse_target" then hasMouse = true end
+		if clue.type == "position_data" then hasPosition = true end
+		if clue.type == "action_type" then hasAction = true end
+		if clue.type == "input_triggered" then isInputTriggered = true end
+		if clue.type == "gui_button_triggered" then isGuiTriggered = true end
+		if clue.type == "proximity_triggered" then isProximityTriggered = true end
+	end
+
+	-- Always add security validation
+	addLine("-- SECURITY: Always validate the player and data on the server")
+	addLine("if not player or not player.Parent then return end")
+	addBlank()
+
+	if hasAction then
+		addLine("-- Detected: Action-based remote (likely a command/action type system)")
+		addLine("-- TODO: Validate the action type and handle accordingly")
+		addBlank()
+	end
+
+	if hasMouse then
+		addLine("-- Detected: Mouse/target data is sent from client")
+		addLine("-- SECURITY: Validate target distance from player")
+		addLine("-- local character = player.Character")
+		addLine("-- if character and (target.Position - character.HumanoidRootPart.Position).Magnitude < MAX_DISTANCE then")
+		addLine("--     -- Process action at target")
+		addLine("-- end")
+		addBlank()
+	end
+
+	if hasPosition then
+		addLine("-- Detected: Position/CFrame data is sent from client")
+		addLine("-- SECURITY: Verify the position is reasonable / not exploited")
+		addBlank()
+	end
+
+	if isGuiTriggered then
+		addLine("-- Detected: Triggered by GUI button click on client")
+	end
+	if isInputTriggered then
+		addLine("-- Detected: Triggered by user input (keyboard/mouse)")
+	end
+	if isProximityTriggered then
+		addLine("-- Detected: Triggered by ProximityPrompt interaction")
+	end
+
+	addLine("-- TODO: Implement server-side logic for this event")
+	if #info.arguments > 0 then
+		addLine("-- Client sends: " .. table.concat(info.arguments, ", "))
+	end
+
+	indent = indent - 1
+	addLine("end)")
+
+	return table.concat(lines, "\n")
+end
+
+--------------------------------------------------------------------------------
+-- MAIN RECONSTRUCTION ENGINE
+--------------------------------------------------------------------------------
+
+function ScriptReconstructor:AnalyzeScript(localScript)
+	assert(localScript, "LocalScript instance required")
+
+	local source
+	if type(decompile) == "function" then
+		source = decompile(localScript)
+	else
+		-- Fallback: try .Source (only works in command bar / plugins)
+		local success, src = pcall(function()
+			return localScript.Source
+		end)
+		if success then
+			source = src
+		else
+			warn("[Reconstructor] Cannot access script source. 'decompile' function not available.")
+			return nil
+		end
+	end
+
+	if not source or source == "" then
+		warn("[Reconstructor] Empty source for:", localScript:GetFullName())
+		return nil
+	end
+
+	log("Analyzing:", localScript:GetFullName())
+	log("Source length:", #source, "characters")
+
+	local allReconstructed = {}
+
+	-- Sort patterns by priority
+	local sortedPatterns = {}
+	for _, pattern in ipairs(PatternDatabase) do
+		table.insert(sortedPatterns, pattern)
+	end
+	table.sort(sortedPatterns, function(a, b) return a.priority > b.priority end)
+
+	-- Run each pattern
+	for _, pattern in ipairs(sortedPatterns) do
+		local matched = pattern.match(source)
+		if matched then
+			log("Pattern matched:", pattern.name, "- Found", #matched, "instances")
+			local scripts = pattern.reconstruct(matched)
+			for _, script in ipairs(scripts) do
+				table.insert(allReconstructed, script)
+			end
+		end
+	end
+
+	return allReconstructed
+end
+
+function ScriptReconstructor:ReconstructAll()
+	local allScripts = {}
+
+	-- Find all LocalScripts in the game
+	local function scanDescendants(parent)
+		for _, child in ipairs(parent:GetChildren()) do
+			if child:IsA("LocalScript") then
+				local results = self:AnalyzeScript(child)
+				if results then
+					for _, result in ipairs(results) do
+						result.sourceScript = child:GetFullName()
+						table.insert(allScripts, result)
+					end
+				end
+			end
+			pcall(function()
+				scanDescendants(child)
+			end)
+		end
+	end
+
+	-- Scan common locations
+	local locations = {
+		game:GetService("Players").LocalPlayer and game:GetService("Players").LocalPlayer:FindFirstChild("PlayerScripts"),
+		game:GetService("Players").LocalPlayer and game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui"),
+		game:GetService("StarterGui"),
+		game:GetService("StarterPack"),
+		game:GetService("StarterPlayer"),
+		game:GetService("ReplicatedFirst"),
+	}
+
+	for _, loc in ipairs(locations) do
+		if loc then
+			scanDescendants(loc)
+		end
+	end
+
+	return allScripts
+end
+
+function ScriptReconstructor:GenerateOutput(reconstructedScripts)
+	if not reconstructedScripts or #reconstructedScripts == 0 then
+		log("No scripts to reconstruct.")
+		return
+	end
+
+	log("=== RECONSTRUCTION RESULTS ===")
+	log("Total scripts reconstructed:", #reconstructedScripts)
+	log("")
+
+	for i, script in ipairs(reconstructedScripts) do
+		log(string.format("--- Script %d: %s (→ %s) ---", i, script.name, script.parent))
+		if script.sourceScript then
+			log("Source LocalScript:", script.sourceScript)
+		end
+		log("")
+		print(script.source)
+		log("")
+		log("--- End of Script " .. i .. " ---")
+		log("")
+	end
+end
+
+-- Convenience: Analyze a single LocalScript and print results
+function ScriptReconstructor:Quick(localScript)
+	local results = self:AnalyzeScript(localScript)
+	if results then
+		self:GenerateOutput(results)
+	end
+end
+
+-- Convenience: Scan everything and print
+function ScriptReconstructor:FullScan()
+	local results = self:ReconstructAll()
+	self:GenerateOutput(results)
+	return results
+end
+
+return ScriptReconstructor
